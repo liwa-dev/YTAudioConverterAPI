@@ -1,0 +1,30 @@
+[Unit]
+Description=YouTube Audio Ripper Service
+After=network.target
+
+[Service]
+User=magnus
+Group=magnus
+WorkingDirectory=/home/user/YTAudioConverterAPI
+ExecStart=/usr/bin/python3 /home/user/YTAudioConverterAPI/main.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/user/YTAudioConverterAPI/.env
+
+# Security enhancements
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateDevices=true
+
+# Ensure write access to necessary directories
+ReadWritePaths=/home/user/YTAudioConverterAPI
+
+[Install]
+WantedBy=multi-user.target

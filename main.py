@@ -1,25 +1,37 @@
-from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context,make_response
-
-from pytube import YouTube as YT
-from youtubesearchpython import VideosSearch
 import os
 import re
 import uuid
 import time
-from flask_cors import cross_origin,CORS
 import json
-from threading import Thread
 import threading
-import youtube_dl
-from pydub import AudioSegment
+import requests
+from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context, make_response
+from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from pytube import YouTube as YT
+from youtubesearchpython import VideosSearch
+import yt_dlp
+from pydub import AudioSegment
+from dotenv import load_dotenv
+import logging
+from urllib.parse import urlparse
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-cors = CORS(app)
+
+# Configure CORS
+allowed_origins = os.getenv('ALLOWED_ORIGINS', '').split(',')
+cors = CORS(app, resources={r"/*": {"origins": allowed_origins}})
 
 # Define the retention period in seconds (e.g., 24 hours)
-RETENTION_PERIOD = 2 * 60 * 60
+RETENTION_PERIOD = int(os.getenv('RETENTION_PERIOD', 2 * 60 * 60))
 
 # Configure rate limiting
 limiter = Limiter(
@@ -29,216 +41,192 @@ limiter = Limiter(
     storage_uri="memory://",
 )
 
-
-
 @app.route('/')
 def nothing():
-    response = jsonify({'msg': 'Use /download or /audios/<filename>'})
+    response = jsonify({'msg': 'Use /download or /mp3/<filename>'})
     response.headers.add('Content-Type', 'application/json')
     return response
 
 def compress_audio(file_path):
-    audio = AudioSegment.from_file(file_path)
-    compressed_audio = audio.export(file_path, format='mp3', bitrate='256k')
-    compressed_audio.close()
-
-
+    if not os.path.exists(file_path):
+        logger.warning(f"File {file_path} does not exist. Skipping compression.")
+        return
+    try:
+        audio = AudioSegment.from_file(file_path)
+        compressed_audio = audio.export(file_path, format='mp3', bitrate='128k')
+        compressed_audio.close()
+    except Exception as e:
+        logger.error(f"Error compressing audio: {str(e)}")
 
 def generate(host_url, video_url):
     ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': 'audios/%(id)s.%(ext)s',
+        'outtmpl': 'mp3/%(id)s.%(ext)s',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '256',
-            'nopostoverwrites': True  # Avoid post-overwriting since we'll manually convert to MP3
+            'preferredquality': '128',
+            'nopostoverwrites': True
         }],
-        'verbose': True  # Enable verbose output for debugging
-
+        'verbose': True,
+        'ffmpeg_args': ['-threads', '4'],
     }
 
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(video_url, download=False)
-        duration = info_dict.get('duration')
+    cookies_path = os.path.join(os.getcwd(), 'cookies.txt')
+    if os.path.exists(cookies_path):
+        ydl_opts['cookiefile'] = cookies_path
+    else:
+        logger.warning("Warning: cookies.txt not found. Proceeding without cookies.")
 
-        if duration and duration <= 300:  # Check if video duration is less than or equal to 5 minutes (300 seconds)
-            info_dict = ydl.extract_info(video_url, download=True)
-            audio_file_path = ydl.prepare_filename(info_dict)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info_dict = ydl.extract_info(video_url, download=False)
+            video_id = info_dict.get('id')
+            
+            file_name = f"{video_id}.mp3"
+            file_path = os.path.join('mp3', file_name)
+            
+            if os.path.exists(file_path):
+                logger.info(f"File {file_path} already exists. Skipping download.")
+            else:
+                info_dict = ydl.extract_info(video_url, download=True)
+                audio_file_path = ydl.prepare_filename(info_dict)
+                compress_audio(file_path)
+            
             thumbnail_url = info_dict.get('thumbnail')
-
-            file_name, file_extension = os.path.splitext(audio_file_path)
-            file_name = os.path.basename(file_name)
             expiration_timestamp = int(time.time()) + RETENTION_PERIOD
+            
+            # Fire webhook
+            webhook_url = os.getenv('WEBHOOK_URL')
+            webhook_data = {
+                "status": "complete",
+                "file_name": file_name,
+                "expiration_timestamp": expiration_timestamp
+            }
+            try:
+                requests.post(webhook_url, json=webhook_data)
+            except requests.RequestException as e:
+                logger.error(f"Failed to send webhook: {str(e)}")
 
-            compress_audio("audios/" + file_name + ".mp3")
-            # Convert the JSON response to bytes
             response_dict = {
                 'img': thumbnail_url,
-                'direct_link': "http://youtube-1.fishyflick.repl.co/audios/" + file_name + ".mp3",
+                'direct_link': f"{os.getenv('BASE_URL', 'https://example.com')}/mp3/{file_name}",
                 'expiration_timestamp': expiration_timestamp
             }
             response_json = json.dumps(response_dict)
             response_bytes = response_json.encode('utf-8')
-            # Yield the response bytes within the application context
             with app.app_context():
                 yield response_bytes
-        else:
-            response_dict = {
-              'error' : 'Video duration must be less than or equal to 5 minutes.'
-            }
-            response_json = json.dumps(response_dict)
-            response_bytes = response_json.encode('utf-8')
-            yield response_bytes
-
-
-
+    except Exception as e:
+        logger.error(f"Error in generate function: {str(e)}")
+        yield json.dumps({"error": "An error occurred during processing"}).encode('utf-8')
 
 @app.route('/search', methods=['GET'])
 @limiter.limit("5/minute", error_message="Too many requests")
 def search():
     q = request.args.get('q')
-    if q is None or len(q) == 0:
-        return jsonify({'error': 'Invalid search query'})
-    else:
+    if q is None or len(q.strip()) == 0:
+        return jsonify({'error': 'Invalid search query'}), 400
+    try:
         s = VideosSearch(q, limit=15)
         results = s.result()["result"]
-        search_results = []
-        for video in results:
-            duration = video["duration"]
-            if ":" in duration:
-                parts = duration.split(":")
-                if len(parts) == 2:  # Minutes:Seconds format
-                    minutes, seconds = map(int, parts)
-                    total_seconds = minutes * 60 + seconds
-                    if total_seconds < 300:  # Less than 5 minutes
-                        search_results.append({'title': video["title"], 'url': video["link"], 'thumbnail': video["thumbnails"][0]["url"]})
+        search_results = [{'title': video["title"], 'url': video["link"], 'thumbnail': video["thumbnails"][0]["url"]} for video in results]
         response = jsonify({'search': search_results})
         response.headers.add('Content-Type', 'application/json')
         return response
-
-
-
-    
+    except Exception as e:
+        logger.error(f"Error in search function: {str(e)}")
+        return jsonify({'error': 'An error occurred during search'}), 500
 
 @app.route('/download', methods=['GET'])
-@limiter.limit("5/minute", error_message="Too many requests")  # Limit to 5 requests per minute
+@limiter.limit("5/minute", error_message="Too many requests")
 def download_audio():
+    api_key = request.headers.get('x-key')
+    if api_key != os.getenv('API_KEY'):
+        return jsonify({'error': 'Invalid or missing key header'}), 403
+
     video_url = request.args.get('video_url')
+    if not video_url or not urlparse(video_url).scheme:
+        return jsonify({'error': 'Invalid or missing video URL'}), 400
+
     host_url = request.base_url + '/'
     return Response(stream_with_context(generate(host_url, video_url)), mimetype='application/json')
 
-
-@app.route('/audios/<path:filename>', methods=['GET'])
-@limiter.limit("2/5seconds", error_message="Too many requests")  # Limit to 2 requests per 30 seconds
+@app.route('/mp3/<path:filename>', methods=['GET'])
+@limiter.limit("2/5seconds", error_message="Too many requests")
 def serve_audio(filename):
     root_dir = os.getcwd()
-    file_path = os.path.join(root_dir, 'audios', filename)
+    file_path = os.path.join(root_dir, 'mp3', filename)
     
-    # Check if the file exists
-    if not os.path.isfile(file_path):
+    if not os.path.isfile(file_path) or not filename.endswith('.mp3'):
         return make_response('Audio file not found', 404)
     
-    # Get the total file size
     file_size = os.path.getsize(file_path)
-    
-    # Parse the Range header
     range_header = request.headers.get('Range')
     
     if range_header:
-        # Extract the start and end positions from the Range header
         start_pos, end_pos = parse_range_header(range_header, file_size)
-        
-        # Set the response headers for partial content
         response = make_partial_response(file_path, start_pos, end_pos, file_size)
     else:
-        # Set the response headers for the entire content
         response = make_entire_response(file_path, file_size)
     
-    # Set CORS headers
-    response.headers.set('Access-Control-Allow-Origin', '*')
+    response.headers.set('Access-Control-Allow-Origin', ', '.join(allowed_origins))
     response.headers.set('Access-Control-Allow-Methods', 'GET')
     response.headers.set('Content-Type', 'audio/mpeg')
+    response.headers.set('X-Content-Type-Options', 'nosniff')
+    response.headers.set('Content-Security-Policy', "default-src 'self'")
     
     return response
 
-
 def parse_range_header(range_header, file_size):
-    # Extract the start and end positions from the Range header
     range_match = re.search(r'(\d+)-(\d*)', range_header)
     start_pos = int(range_match.group(1)) if range_match.group(1) else 0
     end_pos = int(range_match.group(2)) if range_match.group(2) else file_size - 1
-    
     return start_pos, end_pos
 
 def make_partial_response(file_path, start_pos, end_pos, file_size):
-    # Open the audio file in binary mode
     with open(file_path, 'rb') as file:
-        # Seek to the start position
         file.seek(start_pos)
-        
-        # Calculate the length of the content to be served
         content_length = end_pos - start_pos + 1
-        
-        # Read the content from the file
         content = file.read(content_length)
     
-    # Create the response with partial content
     response = make_response(content)
-    
-    # Set the Content-Range header
     response.headers.set('Content-Range', f'bytes {start_pos}-{end_pos}/{file_size}')
-    
-    # Set the Content-Length header
     response.headers.set('Content-Length', str(content_length))
-    
-    # Set the status code to 206 (Partial Content)
     response.status_code = 206
-    
     return response
 
 def make_entire_response(file_path, file_size):
-    # Read the entire content of the file
     with open(file_path, 'rb') as file:
         content = file.read()
     
-    # Create the response with the entire content
     response = make_response(content)
-    
-    # Set the Content-Length header
     response.headers.set('Content-Length', str(file_size))
-    
     return response
-
-
 
 def delete_expired_files():
     current_timestamp = int(time.time())
-
-    # Iterate over the files in the 'audios' directory
-    for file_name in os.listdir('audios'):
-        file_path = os.path.join('audios', file_name)
-        print("current time",current_timestamp,"time file:",os.path.getmtime(file_path) + RETENTION_PERIOD)
+    for file_name in os.listdir('mp3'):
+        file_path = os.path.join('mp3', file_name)
         if (os.path.isfile(file_path) and
                 current_timestamp > os.path.getmtime(file_path) + RETENTION_PERIOD):
-            # Delete the expired file
-            os.remove(file_path)
-
+            try:
+                os.remove(file_path)
+                logger.info(f"Deleted expired file: {file_path}")
+            except Exception as e:
+                logger.error(f"Error deleting file {file_path}: {str(e)}")
 
 def delete_files_task():
     delete_expired_files()
-    threading.Timer(100, delete_files_task).start()
+    threading.Timer(3600, delete_files_task).start()  # Run every hour
 
 def run():
-  app.run(host='0.0.0.0')
-
+    app.run(host='127.0.0.1', port=5000)
 
 def keep_alive():
-    t = Thread(target=run)
+    t = threading.Thread(target=run)
     t.start()
 
 if __name__ == '__main__':
-    # Schedule a task to delete expired files every hour
     delete_files_task()
     keep_alive()
-    

@@ -1,0 +1,5 @@
+# Netscape HTTP Cookie File
+# https://github.com/hrdl-github/cookies-txt
+# Firefox plugin https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/
+
+

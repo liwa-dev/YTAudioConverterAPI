@@ -1,0 +1,9 @@
+flask
+pytube
+youtube-search-python
+flask_cors
+yt-dlp
+pydub
+flask_limiter
+python-dotenv
+requests
