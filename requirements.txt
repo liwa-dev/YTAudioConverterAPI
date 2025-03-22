@@ -1,0 +1,7 @@
+flask==2.0.1
+pytube==12.1.0
+youtubesearchpython==1.6.6
+youtube_dl==2021.12.17
+pydub==0.25.1
+flask_cors==3.0.10
+flask_limiter==2.8.1
